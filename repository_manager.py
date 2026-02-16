@@ -52,3 +52,13 @@ class RepositoryManager:
         if not isinstance(entries, list):
             return []
         return list(reversed(entries[-limit:]))
+
+    def remove_latest_entry(self) -> bool:
+        """Remove the latest memory entry if present."""
+        data = self._read()
+        entries = data.get("global_memory", [])
+        if not isinstance(entries, list) or not entries:
+            return False
+        entries.pop()
+        self._write(data)
+        return True
