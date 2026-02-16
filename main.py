@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from io import BytesIO
 from typing import List, Tuple
 
 import discord
@@ -12,6 +13,8 @@ from groq import APIError, Groq, RateLimitError
 
 from characteristics import get_system_prompt
 from fandom import search_fandom
+from identification.card_generator import generate_id_card
+from identification.id_manager import IDManager
 from logger import BotLogger
 from memory_manager import MemoryManager
 from repository_manager import RepositoryManager
@@ -44,6 +47,7 @@ memory_manager = MemoryManager()
 repository_manager = RepositoryManager("repository.json")
 token_manager = TokenManager("token_stats.json")
 setup_manager = SetupManager("setup_config.json")
+id_manager = IDManager("identity_database.json")
 bot_logger = BotLogger("logs.txt")
 
 website_port = int(os.getenv("PORT", "8080"))
@@ -89,6 +93,10 @@ def _select_model() -> str:
     return DEFAULT_MODEL
 
 
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 async def _call_groq(messages: List[dict], model_name: str):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY environment variable.")
@@ -129,6 +137,44 @@ def _build_embed(reply_text: str, is_admin: bool, usage_text: str = "", warning:
         footer_text += f" | {usage_text}"
     embed.set_footer(text=footer_text)
     return embed
+
+
+def _build_identity_embed(target: discord.abc.User, record: dict[str, str]) -> discord.Embed:
+    embed = discord.Embed(
+        title="UOI Identification",
+        description=(
+            f"**Name:** {record.get('full_name', 'Unknown')}\n"
+            f"**UOI ID:** {record.get('uoi_id', 'N/A')}\n"
+            f"**Role:** {record.get('role', 'Member')}\n"
+            f"**Status:** {record.get('status', 'Active')}\n"
+            f"**Date Joined:** {record.get('date_joined', 'N/A')}"
+        ),
+        color=discord.Color.red(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(name=str(target), icon_url=target.display_avatar.url)
+    embed.set_footer(text="Union of Indians Identity Authority")
+    return embed
+
+
+async def _avatar_bytes(user: discord.abc.User) -> bytes | None:
+    try:
+        return await user.display_avatar.read()
+    except Exception as exc:
+        bot_logger.log_error("avatar_read", exc)
+        return None
+
+
+async def _card_file(record: dict[str, str], avatar_data: bytes | None, user_id: int) -> discord.File:
+    buffer: BytesIO = await asyncio.to_thread(generate_id_card, record, avatar_data)
+    return discord.File(buffer, filename=f"uoi_identity_{user_id}.png")
+
+
+async def _require_admin(interaction: discord.Interaction) -> bool:
+    if _is_admin(interaction.user.id):
+        return True
+    await interaction.response.send_message("Admin access required.", ephemeral=True)
+    return False
 
 
 @client.event
@@ -203,6 +249,104 @@ async def forget_entry(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Repository memory is already empty.", ephemeral=True)
         return
     await interaction.response.send_message("Removed the latest repository memory entry.")
+
+
+@tree.command(name="register", description="Register your UOI identity and receive your ID card.")
+@app_commands.describe(full_name="Your full name for identity registration")
+async def register_identity(interaction: discord.Interaction, full_name: str) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        success, message_text, record = id_manager.register_user(interaction.user.id, full_name)
+        if not success or record is None:
+            await interaction.followup.send(message_text, ephemeral=True)
+            return
+
+        avatar_data = await _avatar_bytes(interaction.user)
+        file = await _card_file(record, avatar_data, interaction.user.id)
+        embed = _build_identity_embed(interaction.user, record)
+        await interaction.followup.send(content=message_text, embed=embed, file=file, ephemeral=True)
+    except Exception as exc:
+        bot_logger.log_error("register_identity", exc)
+        await interaction.followup.send("Unable to complete registration right now.", ephemeral=True)
+
+
+@tree.command(name="id", description="View your UOI identification card.")
+async def show_my_identity(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        record = id_manager.get_user(interaction.user.id)
+        if record is None:
+            await interaction.followup.send("You are not registered. Use /register first.", ephemeral=True)
+            return
+
+        avatar_data = await _avatar_bytes(interaction.user)
+        file = await _card_file(record, avatar_data, interaction.user.id)
+        embed = _build_identity_embed(interaction.user, record)
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    except Exception as exc:
+        bot_logger.log_error("show_my_identity", exc)
+        await interaction.followup.send("Unable to load your ID card right now.", ephemeral=True)
+
+
+@tree.command(name="verify", description="Verify a member by displaying their UOI ID card.")
+@app_commands.describe(user="Member to verify")
+async def verify_identity(interaction: discord.Interaction, user: discord.Member) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        record = id_manager.get_user(user.id)
+        if record is None:
+            await interaction.followup.send("That user is not registered.")
+            return
+
+        avatar_data = await _avatar_bytes(user)
+        file = await _card_file(record, avatar_data, user.id)
+        embed = _build_identity_embed(user, record)
+        await interaction.followup.send(embed=embed, file=file)
+    except Exception as exc:
+        bot_logger.log_error("verify_identity", exc)
+        await interaction.followup.send("Unable to verify this user right now.")
+
+
+@tree.command(name="setrole", description="Admin: set a registered user's UOI role.")
+@app_commands.describe(user="Target member", role="New role value")
+async def set_role(interaction: discord.Interaction, user: discord.Member, role: str) -> None:
+    if not await _require_admin(interaction):
+        return
+
+    try:
+        _, message_text = id_manager.set_role(user.id, role)
+        await interaction.response.send_message(message_text, ephemeral=True)
+    except Exception as exc:
+        bot_logger.log_error("set_role", exc)
+        await interaction.response.send_message("Unable to update role right now.", ephemeral=True)
+
+
+@tree.command(name="setstatus", description="Admin: set a registered user's status.")
+@app_commands.describe(user="Target member", status="Active, Suspended, or Revoked")
+async def set_status(interaction: discord.Interaction, user: discord.Member, status: str) -> None:
+    if not await _require_admin(interaction):
+        return
+
+    try:
+        _, message_text = id_manager.set_status(user.id, status)
+        await interaction.response.send_message(message_text, ephemeral=True)
+    except Exception as exc:
+        bot_logger.log_error("set_status", exc)
+        await interaction.response.send_message("Unable to update status right now.", ephemeral=True)
+
+
+@tree.command(name="revoke", description="Admin: revoke a registered user's identity.")
+@app_commands.describe(user="Target member")
+async def revoke_identity(interaction: discord.Interaction, user: discord.Member) -> None:
+    if not await _require_admin(interaction):
+        return
+
+    try:
+        _, message_text = id_manager.revoke_user(user.id)
+        await interaction.response.send_message(message_text, ephemeral=True)
+    except Exception as exc:
+        bot_logger.log_error("revoke_identity", exc)
+        await interaction.response.send_message("Unable to revoke user right now.", ephemeral=True)
 
 
 @client.event
@@ -283,7 +427,7 @@ async def on_message(message: discord.Message) -> None:
         total_tokens=total_tokens,
     )
 
-    is_admin = message.author.id in ADMIN_IDS
+    is_admin = _is_admin(message.author.id)
     compact_usage = (
         usage_text.replace("**Token Usage**", "").replace("\n", " ").replace("-", "|").strip()
         if is_admin
