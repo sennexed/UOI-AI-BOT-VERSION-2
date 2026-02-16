@@ -52,7 +52,8 @@ def _build_messages(user_id: int, user_prompt: str) -> List[dict]:
     memory_messages = memory_manager.get_session_messages(user_id)
 
     repository_context = "\n".join(
-        f"- [{entry.get('timestamp', '')}] {entry.get('content', '')}" for entry in repo_entries
+        f"- [{entry.get('timestamp', '')}] {entry.get('content', '')}"
+        for entry in repo_entries
     ) or "- No repository memory yet."
 
     messages: List[dict] = [
@@ -103,7 +104,7 @@ async def on_message(message: discord.Message) -> None:
         if allowed_channel and message.channel.id != allowed_channel:
             return
 
-    command_body = content[len(BOT_PREFIX) :].strip()
+    command_body = content[len(BOT_PREFIX):].strip()
     if not command_body:
         return
 
@@ -114,7 +115,9 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send("`UOI setup` can only be used inside a server.")
             return
         setup_manager.set_channel(message.guild.id, message.channel.id)
-        await message.channel.send(f"Setup complete. I will now reply only in {message.channel.mention}.")
+        await message.channel.send(
+            f"Setup complete. I will now reply only in {message.channel.mention}."
+        )
         return
 
     if lower == "unset":
@@ -173,14 +176,16 @@ async def on_message(message: discord.Message) -> None:
         await message.channel.send("I received an empty response from the model. Please retry.")
         return
 
+    # Store conversation only in session memory (NOT repository)
     memory_manager.add_message(user_id, "user", user_prompt)
     memory_manager.add_message(user_id, "assistant", reply_text)
     memory_manager.clear_expired_sessions()
 
-    repository_manager.add_entry(f"User: {user_prompt}\nAssistant: {reply_text}")
-
     if user_id in ADMIN_IDS:
-        reply_text += update_and_format_usage(getattr(completion, "usage", None), token_manager)
+        reply_text += update_and_format_usage(
+            getattr(completion, "usage", None),
+            token_manager,
+        )
 
     await message.channel.send(reply_text)
 
