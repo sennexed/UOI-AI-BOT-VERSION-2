@@ -2,3 +2,8 @@ discord.py
 groq
 google-generativeai
 requests
+gTTS
+pypdf
+PyMuPDF
+pytesseract
+pillow
