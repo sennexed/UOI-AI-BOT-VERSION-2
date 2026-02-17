@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 from typing import List
 
 import discord
@@ -18,6 +19,7 @@ from setup_manager import SetupManager
 from token_manager import TokenManager
 from usage_counter import update_and_format_usage
 from website import StatusWebsite
+from pdf_tts import PdfTtsService
 
 
 BOT_PREFIX = "UOI "
@@ -41,6 +43,7 @@ memory_manager = MemoryManager()
 repository_manager = RepositoryManager("repository.json")
 token_manager = TokenManager("token_stats.json")
 setup_manager = SetupManager("setup_config.json")
+pdf_tts_service = PdfTtsService()
 
 website_port = int(os.getenv("PORT", "8080"))
 status_website = StatusWebsite(token_manager.get_stats, port=website_port)
@@ -67,6 +70,29 @@ def _build_messages(user_id: int, user_prompt: str) -> List[dict]:
     messages.extend(memory_messages)
     messages.append({"role": "user", "content": user_prompt})
     return messages
+
+
+def _parse_pdf2speech_options(command_body: str) -> tuple[str, str, int, bool]:
+    mode = "hybrid"
+    lang = "en"
+    max_pages = 8
+    slow = False
+
+    tokens = command_body.split()[1:]
+    for token in tokens:
+        key, _, value = token.partition("=")
+        key = key.lower().strip()
+        value = value.strip()
+        if key == "mode" and value:
+            mode = value.lower()
+        elif key == "lang" and value:
+            lang = value.lower()
+        elif key in {"pages", "max_pages"} and value.isdigit():
+            max_pages = max(1, min(20, int(value)))
+        elif key == "slow" and value.lower() in {"1", "true", "yes", "on"}:
+            slow = True
+
+    return mode, lang, max_pages, slow
 
 
 async def _call_groq(messages: List[dict]):
@@ -144,6 +170,68 @@ async def on_message(message: discord.Message) -> None:
             return
         wiki, topic = parts
         await message.channel.send(search_fandom(wiki, topic))
+        return
+
+    if lower == "pdfmodes":
+        await message.channel.send(
+            "PDF-to-speech modes:\n"
+            "- `text`: extract embedded/selectable PDF text only.\n"
+            "- `ocr`: OCR each page image (for scanned/graphical PDFs).\n"
+            "- `hybrid`: try text first, auto-fallback to OCR when needed.\n\n"
+            "Usage: `UOI pdf2speech mode=hybrid lang=en pages=8 slow=false` and attach a PDF file."
+        )
+        return
+
+    if lower.startswith("pdf2speech"):
+        pdf_attachment = next(
+            (
+                attachment
+                for attachment in message.attachments
+                if (attachment.filename or "").lower().endswith(".pdf")
+            ),
+            None,
+        )
+        if pdf_attachment is None:
+            await message.channel.send(
+                "Attach a PDF and run: `UOI pdf2speech mode=hybrid lang=en pages=8 slow=false`"
+            )
+            return
+
+        mode, lang, max_pages, slow = _parse_pdf2speech_options(command_body)
+
+        try:
+            pdf_bytes = await pdf_attachment.read()
+            extraction = await asyncio.to_thread(
+                pdf_tts_service.extract_text,
+                pdf_bytes,
+                mode,
+                max_pages,
+            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                out_path = os.path.join(temp_dir, "pdf_tts.mp3")
+                await asyncio.to_thread(
+                    pdf_tts_service.text_to_mp3,
+                    extraction.text,
+                    out_path,
+                    lang,
+                    slow,
+                )
+
+                summary = (
+                    f"Mode used: **{extraction.mode_used}** | "
+                    f"Pages processed: **{extraction.extracted_pages}/{extraction.total_pages}**\n"
+                    f"Language: **{lang}** | Slow: **{slow}**"
+                )
+                await message.channel.send(
+                    summary,
+                    file=discord.File(out_path, filename="pdf_tts.mp3"),
+                )
+        except ValueError as exc:
+            await message.channel.send(f"PDF/TTS error: {exc}")
+        except RuntimeError as exc:
+            await message.channel.send(f"PDF/TTS runtime error: {exc}")
+        except Exception:
+            await message.channel.send("Failed to process that PDF. Try a smaller file or fewer pages.")
         return
 
     user_prompt = command_body
